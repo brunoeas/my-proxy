@@ -4,48 +4,67 @@ import io.quarkus.runtime.StartupEvent;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientOptions;
+import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerRequest;
+import io.vertx.core.net.NetClient;
+import io.vertx.core.net.NetClientOptions;
+import io.vertx.core.net.NetSocket;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
+import jakarta.inject.Inject;
+import lombok.extern.jbosslog.JBossLog;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 import java.net.URI;
 import java.util.List;
 
+@JBossLog
 @ApplicationScoped
 public class ProxyServer {
 
-    private static final List<String> BLACKLIST_HEADERS = List.of("Connection", "Proxy-Connection", "Keep-Alive", "Transfer-Encoding", "TE", "Trailer", "Upgrade");
+    private static final List<String> BLACKLIST_HEADERS = List.of(
+            "Connection", "Proxy-Connection", "Keep-Alive", "Transfer-Encoding", "TE", "Trailer", "Upgrade"
+    );
+
+    @Inject
+    Vertx vertx;
 
     @ConfigProperty(name = "proxy.port", defaultValue = "3000")
     int proxyPort;
 
-    void onStart(@Observes StartupEvent ev, Vertx vertx) {
+    private NetClient client = null;
 
-        vertx.createHttpServer()
-                .requestHandler(request -> {
-                    handleHttp(request, vertx);
-                    System.out.println("🚀🚀🚀 Sua requisição acabou de passar pelo Proxy mais daora, parabéns! 🚀🚀🚀");
-                })
-                .listen(proxyPort, res -> {
-                    if (res.succeeded()) {
-                        System.out.printf("🚀 Proxy rodando na porta %s%n", proxyPort);
-                    } else {
-                        res.cause().printStackTrace();
-                    }
-                });
+    void onStart(@Observes StartupEvent ev) {
+        HttpServer server = vertx.createHttpServer();
+        client = vertx.createNetClient(new NetClientOptions().setTcpNoDelay(true));
+
+        server.requestHandler(request -> {
+            handleRequest(request);
+            log.info("🚀🚀🚀 Sua requisição acabou de entrar no Proxy mais daora da rede, parabéns! 🚀🚀🚀");
+
+        }).listen(proxyPort, res -> {
+            if (res.succeeded()) {
+                log.infof("🚀🚀🚀 Proxy rodando na porta %s%n 🚀🚀🚀", proxyPort);
+            } else {
+                log.error("Falha ao iniciar Proxy", res.cause());
+            }
+        });
     }
 
-    private void handleHttp(HttpServerRequest request, Vertx vertx) {
+    private void handleRequest(HttpServerRequest request) {
         if ("CONNECT".equalsIgnoreCase(request.method().name())) {
-            System.out.println("🔒 Conexão HTTPS detectada: " + request.uri());
-            handleConnect(request, vertx);
-            return;
-        }
-        System.out.println("🌐 Requisição HTTP detectada: " + request.uri());
+            log.info("🔒 Conexão HTTPS detectada: " + request.uri());
+            handleConnectHttps(request);
 
+        } else {
+            log.info("🌐 Requisição HTTP detectada: " + request.uri());
+            handleHttp(request);
+        }
+    }
+
+    private void handleHttp(HttpServerRequest requisicaoOriginal) {
         try {
-            URI uri = new URI(request.uri());
+            URI uri = new URI(requisicaoOriginal.uri());
 
             String host = uri.getHost();
             int port = uri.getPort() == -1 ? 80 : uri.getPort();
@@ -54,73 +73,135 @@ public class ProxyServer {
                 path += "?" + uri.getRawQuery();
             }
 
-            HttpClient client = vertx.createHttpClient(
-                    new HttpClientOptions()
-                            .setDefaultHost(host)
-                            .setDefaultPort(port)
-            );
+            HttpClient client = vertx.createHttpClient(new HttpClientOptions().setDefaultHost(host).setDefaultPort(port));
 
-            client.request(request.method(), port, host, path)
+            client.request(requisicaoOriginal.method(), port, host, path)
                     .onSuccess(clientRequest -> {
 
-                        request.headers().forEach(header -> {
+                        requisicaoOriginal.headers().forEach(header -> {
                             if (BLACKLIST_HEADERS.stream().noneMatch(h -> h.equalsIgnoreCase(header.getKey()))) {
                                 clientRequest.putHeader(header.getKey(), header.getValue());
                             }
                         });
 
-                        request.pipeTo(clientRequest);
+                        requisicaoOriginal.pipeTo(clientRequest);
 
                         clientRequest.response().onSuccess(response -> {
-                            request.response().setStatusCode(response.statusCode());
+                            requisicaoOriginal.response().setStatusCode(response.statusCode());
                             response.headers().forEach(header ->
-                                    request.response().putHeader(header.getKey(), header.getValue())
+                                    requisicaoOriginal.response().putHeader(header.getKey(), header.getValue())
                             );
-                            response.pipeTo(request.response());
-                            System.out.println("✅✅✅ Requisição HTTP processada com sucesso: " + request.uri());
+                            response.pipeTo(requisicaoOriginal.response());
+                            log.info("✅✅✅ Fim do processamento da requisição HTTP: " + requisicaoOriginal.uri());
                         });
 
                     })
-                    .onFailure(err -> err.printStackTrace());
+                    .onFailure(err -> log.error("Erro ao tratar requisição HTTP", err));
 
         } catch (Exception e) {
-            e.printStackTrace();
-            request.response().setStatusCode(400).end("Bad Request");
+            log.error("Erro ao tratar requisição HTTP", e);
+            requisicaoOriginal.response().setStatusCode(400).end("Unknown Error\n");
         }
     }
 
-    private void handleConnect(HttpServerRequest request, Vertx vertx) {
+    private void handleConnectHttps(HttpServerRequest requisicaoOriginal) {
         try {
-            String authority = request.uri();
-            int idx = authority.lastIndexOf(':');
-            String host = authority.substring(0, idx);
-            int port = Integer.parseInt(authority.substring(idx + 1));
+            if (client == null) {
+                log.error("Erro ao tratar requisição HTTPS: NetClient está null.");
+                requisicaoOriginal.response().setStatusCode(400).end("Unknown Error\n");
+                return;
+            }
 
-            vertx.createNetClient().connect(port, host)
-                    .onSuccess(serverSocket -> {
+            String authority = requisicaoOriginal.uri(); // normalmente host:port
+            HostPort hostPort = parseAuthority(authority);
+            if (hostPort == null) {
+                log.error("Erro ao tratar requisição HTTPS: Não foi possível extrair o Host e a Porta.");
+                requisicaoOriginal.response().setStatusCode(400).end("Bad CONNECT authority\n");
+                return;
+            }
 
-                        request.toNetSocket()
-                                .onSuccess(clientSocket -> {
+            String destHost = hostPort.host();
+            int destPort = hostPort.port();
 
-                                    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n")
-                                            .onSuccess(_ -> {
-                                                clientSocket.pipeTo(serverSocket);
-                                                serverSocket.pipeTo(clientSocket);
-                                                System.out.println("✅✅✅ Requisição HTTPS processada com sucesso (HTTPS Tunnel Established): " + request.uri());
-                                            });
+            client.connect(destPort, destHost, futureServerSocket -> {
+                if (futureServerSocket.succeeded()) {
+                    // responde 200 e transforma a conexão em raw TCP
+                    requisicaoOriginal.response()
+                            .setStatusCode(200)
+                            .setStatusMessage("Connection Established")
+                            .putHeader("Proxy-Agent", "quarkus-vertx-https-proxy/0.1")
+                            .end();
 
-                                })
-                                .onFailure(err -> err.printStackTrace());
+                    // obtém o NetSocket do lado cliente (o navegador/cliente HTTP)
+                    requisicaoOriginal.toNetSocket(clientSocketRes -> {
+                        if (clientSocketRes.succeeded()) {
+                            NetSocket clientSocket = clientSocketRes.result();
+                            NetSocket serverSocket = futureServerSocket.result();
 
-                    })
-                    .onFailure(err -> {
-                        request.response().setStatusCode(502).end();
-                        err.printStackTrace();
+                            // repassa dados nas duas direções
+                            clientSocket.handler(serverSocket::write);
+                            serverSocket.handler(clientSocket::write);
+
+                            // fecha o outro lado se um fechar
+                            clientSocket.closeHandler(_ -> serverSocket.close());
+                            serverSocket.closeHandler(_ -> clientSocket.close());
+
+                            clientSocket.exceptionHandler(t -> {
+                                log.error("Erro ao tratar requisição HTTPS: Client socket error", t);
+                                serverSocket.close();
+                            });
+                            serverSocket.exceptionHandler(t -> {
+                                log.error("Erro ao tratar requisição HTTPS: Server socket error", t);
+                                clientSocket.close();
+                            });
+
+                            log.info("✅✅✅ Fim do processamento da requisição HTTPS: " + requisicaoOriginal.uri());
+
+                        } else {
+                            log.error("Erro ao tratar requisição HTTPS: Failed to obtain client net socket.", clientSocketRes.cause());
+                            futureServerSocket.result().close();
+                        }
                     });
 
+                } else {
+                    log.error("Erro ao tratar requisição HTTPS: Failed to connect to destination.", futureServerSocket.cause());
+                    requisicaoOriginal.response().setStatusCode(502).end("Bad Gateway\n");
+                }
+            });
+
         } catch (Exception e) {
-            e.printStackTrace();
-            request.response().setStatusCode(400).end("Bad Request");
+            log.error("Erro ao tratar requisição HTTPS: Desconhecido.", e);
+            requisicaoOriginal.response().setStatusCode(400).end("Unknown Error\n");
         }
     }
+
+    // Suporte básico para host:port e [ipv6]:port
+    private HostPort parseAuthority(String authority) {
+        if (authority == null || authority.isEmpty()) {
+            return null;
+        }
+
+        try {
+            if (authority.startsWith("[")) {
+                // [ipv6]:port
+                int close = authority.indexOf(']');
+                if (close == -1) return null;
+                String host = authority.substring(1, close);
+                int colon = authority.indexOf(':', close);
+                int port = colon == -1 ? 443 : Integer.parseInt(authority.substring(colon + 1));
+                return new HostPort(host, port);
+            } else {
+                int colon = authority.lastIndexOf(':');
+                if (colon == -1) return new HostPort(authority, 443);
+                String host = authority.substring(0, colon);
+                int port = Integer.parseInt(authority.substring(colon + 1));
+                return new HostPort(host, port);
+            }
+
+        } catch (Exception e) {
+            log.error("Erro ao tratar requisição HTTPS: Failed to parse authority: " + authority, e);
+            return null;
+        }
+    }
+
 }
