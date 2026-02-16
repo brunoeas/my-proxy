@@ -1,0 +1,7 @@
+services:
+  my-proxy:
+    image: brunoeas1/my-proxy:0.0.2-SNAPSHOT
+    container_name: my-proxy
+    network_mode: "host"
+    environment:
+      PROXY_PORT: 3000
