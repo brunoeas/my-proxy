@@ -10,9 +10,18 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import lombok.extern.jbosslog.JBossLog;
 
+import java.util.Objects;
+
+/**
+ * Forward Proxy HTTP operando em modo túnel TCP.
+ * Para method HTTP CONNECT o Proxy cria um túnel TCP para trafegar os bytes do cliente (que também podem ser HTTP).
+ * - Abre conexão TCP
+ * - Para de interpretar HTTP
+ * - Só encaminha bytes nas duas direções sem ler
+ */
 @JBossLog
 @ApplicationScoped
-public class ProxyHTTPS {
+public class ProxyTunelTCP {
 
     @Inject
     Vertx vertx;
@@ -24,17 +33,12 @@ public class ProxyHTTPS {
         this.clientHTTPS = this.vertx.createNetClient(new NetClientOptions().setTcpNoDelay(true));
     }
 
-    public void handleConnectHttps(final HttpServerRequest requisicaoOriginal) {
+    public void openTcpTunnel(final HttpServerRequest requisicaoOriginal, final HostPort hostPort) {
         try {
+            Objects.requireNonNull(hostPort);
             if (this.clientHTTPS == null) {
-                log.error("Erro ao tratar requisição HTTPS: TCP Client está null.");
+                log.error("Erro ao tratar requisição HTTPS: TCP Client do Vertx está null.");
                 requisicaoOriginal.response().setStatusCode(400).end("Unknown Error\n");
-                return;
-            }
-
-            // Extrai da requisição original do Cliente/Navegador o Host e a Porta do server de destino
-            final HostPort hostPort = this.extractHostAndPortHTTPS(requisicaoOriginal);
-            if (hostPort == null) {
                 return;
             }
 
@@ -45,7 +49,9 @@ public class ProxyHTTPS {
                     // Então enquanto a conexão TCP está ativa, é criado um Socket TCP para o cliente poder se comunicar com o Socket TCP do server
                     requisicaoOriginal.toNetSocket(clientSocketRes -> {
                         if (clientSocketRes.succeeded()) {
+                            // Socket do Client/Navegador que enviou a requisição que o Proxy capturou
                             final NetSocket clientSocket = clientSocketRes.result();
+                            // Socket do Server que vai receber os dados HTTP
                             final NetSocket serverSocket = futureServerSocket.result();
 
                             // repassa dados nas duas direções
@@ -65,11 +71,12 @@ public class ProxyHTTPS {
                                 clientSocket.close();
                             });
 
-                            log.info("✅✅✅ Fim do processamento da requisição HTTPS: " + requisicaoOriginal.uri());
+                            log.infof("✅✅✅ URI: \"%s\" - Fim do processamento da requisição HTTPS. 🔒 🔒 🔒", requisicaoOriginal.uri());
 
                         } else {
                             log.error("Erro ao tratar requisição HTTPS: Failed to obtain client net socket.", clientSocketRes.cause());
                             futureServerSocket.result().close();
+                            requisicaoOriginal.response().setStatusCode(400).end("Unknown Error\n");
                         }
                     });
 
@@ -82,47 +89,6 @@ public class ProxyHTTPS {
         } catch (final Exception e) {
             log.error("Erro ao tratar requisição HTTPS: Desconhecido.", e);
             requisicaoOriginal.response().setStatusCode(400).end("Unknown Error\n");
-        }
-    }
-
-    private HostPort extractHostAndPortHTTPS(final HttpServerRequest requisicaoOriginal) {
-        final String authority = requisicaoOriginal.uri(); // normalmente host:port
-        final HostPort hostPort = this.parseAuthority(authority);
-        if (hostPort == null) {
-            log.error("Erro ao tratar requisição HTTPS: Não foi possível extrair o Host e a Porta.");
-            requisicaoOriginal.response().setStatusCode(400).end("Bad CONNECT authority\n");
-            return null;
-        } else {
-            return hostPort;
-        }
-    }
-
-    // Suporte básico para host:port e [ipv6]:port
-    private HostPort parseAuthority(final String authority) {
-        if (authority == null || authority.isEmpty()) {
-            return null;
-        }
-
-        try {
-            if (authority.startsWith("[")) {
-                // [ipv6]:port
-                final int close = authority.indexOf(']');
-                if (close == -1) return null;
-                final String host = authority.substring(1, close);
-                final int colon = authority.indexOf(':', close);
-                final int port = colon == -1 ? 443 : Integer.parseInt(authority.substring(colon + 1));
-                return new HostPort(host, port);
-            } else {
-                final int colon = authority.lastIndexOf(':');
-                if (colon == -1) return new HostPort(authority, 443);
-                final String host = authority.substring(0, colon);
-                final int port = Integer.parseInt(authority.substring(colon + 1));
-                return new HostPort(host, port);
-            }
-
-        } catch (final Exception e) {
-            log.error("Erro ao tratar requisição HTTPS: Failed to parse authority: " + authority, e);
-            return null;
         }
     }
 
