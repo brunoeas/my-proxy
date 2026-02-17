@@ -26,27 +26,33 @@ public class ProxyTunelTCP {
     @Inject
     Vertx vertx;
 
-    private NetClient clientHTTPS = null;
+    private NetClient clientTCP = null;
 
     @PostConstruct
-    public void initProxyHTTPS() {
-        this.clientHTTPS = this.vertx.createNetClient(new NetClientOptions().setTcpNoDelay(true));
+    public void initProxyTunelTCP() {
+        this.clientTCP = this.vertx.createNetClient(new NetClientOptions().setTcpNoDelay(true));
     }
 
     public void openTcpTunnel(final HttpServerRequest requisicaoOriginal, final HostPort hostPort) {
         try {
             Objects.requireNonNull(hostPort);
-            if (this.clientHTTPS == null) {
-                log.error("Erro ao tratar requisição HTTPS: TCP Client do Vertx está null.");
+            if (this.clientTCP == null) {
+                log.error("Erro ao tratar Túnel TCP: TCP Client do Vertx está null.");
                 requisicaoOriginal.response().setStatusCode(400).end("Unknown Error\n");
                 return;
             }
 
-            // Cria uma conexão TCP com o server de destino
-            this.clientHTTPS.connect(hostPort.port(), hostPort.host(), futureServerSocket -> {
+            // Cria uma conexão TCP com o server de destino.
+            // Nessa ordem: Abre um socket TCP. Executa o handshake TCP padrão. Se der certo, entrega um NetSocket.
+            // No contexto desse código o `NetClient clientTCP` não está configurado para fazer handshake TLS.
+            // O handshake TLS será feito entre cliente e servidor, esse Proxy apenas repassa os bytes.
+            this.clientTCP.connect(hostPort.port(), hostPort.host(), futureServerSocket -> {
                 if (futureServerSocket.succeeded()) {
-                    // Depois de confirmar que a conexão TCP com o server foi estabelecida responde 200 ao Client (HTTP/1.1 200 Connection Established)
-                    // Então enquanto a conexão TCP está ativa, é criado um Socket TCP para o cliente poder se comunicar com o Socket TCP do server
+                    // Depois de confirmar que a conexão TCP com o server foi estabelecida responde 200 ao Client (HTTP/1.1 200 Connection Established).
+                    // Significa que a função "HttpServerRequest.toNetSocket()" vai responder "HTTP/1.1 200 Connection Established" ao
+                    // Cliente e também vai criar o Socket TCP para o lado do Cliente se comunicar com o server de destino.
+                    // Então enquanto a conexão TCP está ativa é criado um Socket TCP para o cliente,
+                    // E esta é uma das caracteristica que faz isso ser considerado um Túnel TCP.
                     requisicaoOriginal.toNetSocket(clientSocketRes -> {
                         if (clientSocketRes.succeeded()) {
                             // Socket do Client/Navegador que enviou a requisição que o Proxy capturou
@@ -63,31 +69,31 @@ public class ProxyTunelTCP {
                             serverSocket.closeHandler(_ -> clientSocket.close());
 
                             clientSocket.exceptionHandler(t -> {
-                                log.error("Erro ao tratar requisição HTTPS: Client socket error", t);
+                                log.error("Erro ao tratar Túnel TCP: Client socket error", t);
                                 serverSocket.close();
                             });
                             serverSocket.exceptionHandler(t -> {
-                                log.error("Erro ao tratar requisição HTTPS: Server socket error", t);
+                                log.error("Erro ao tratar Túnel TCP: Server socket error", t);
                                 clientSocket.close();
                             });
 
-                            log.infof("✅✅✅ URI: \"%s\" - Fim do processamento da requisição HTTPS. 🔒 🔒 🔒", requisicaoOriginal.uri());
+                            log.infof("✅✅✅ URI: \"%s\" - Fim do processamento do Túnel TCP. 🔒 🔒 🔒", requisicaoOriginal.uri());
 
                         } else {
-                            log.error("Erro ao tratar requisição HTTPS: Failed to obtain client net socket.", clientSocketRes.cause());
+                            log.error("Erro ao tratar Túnel TCP: Failed to obtain client net socket.", clientSocketRes.cause());
                             futureServerSocket.result().close();
                             requisicaoOriginal.response().setStatusCode(400).end("Unknown Error\n");
                         }
                     });
 
                 } else {
-                    log.error("Erro ao tratar requisição HTTPS: Failed to connect to destination.", futureServerSocket.cause());
+                    log.error("Erro ao tratar Túnel TCP: Failed to connect to destination.", futureServerSocket.cause());
                     requisicaoOriginal.response().setStatusCode(502).end("Bad Gateway\n");
                 }
             });
 
         } catch (final Exception e) {
-            log.error("Erro ao tratar requisição HTTPS: Desconhecido.", e);
+            log.error("Erro ao tratar Túnel TCP: Erro inesperado.", e);
             requisicaoOriginal.response().setStatusCode(400).end("Unknown Error\n");
         }
     }

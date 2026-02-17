@@ -36,7 +36,7 @@ public class ProxyHTTP {
     private HttpClient clientHTTP = null;
 
     @PostConstruct
-    public void initProxyHTTPS() {
+    public void initProxyHTTP() {
         this.clientHTTP = this.vertx.createHttpClient(new HttpClientOptions());
     }
 
