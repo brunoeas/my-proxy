@@ -162,7 +162,7 @@ public class ProxyHTTP {
                                     .onSuccess(serverResponseBody -> {
                                         if (serverResponseBody.length() > 0) {
                                             // Atualiza o cache de requests no Redis com a resposta do server de destino
-                                            this.requestCacheRedis.put(requestKey, serverResponseBody.getBytes())
+                                            this.requestCacheRedis.set(requestKey, serverResponseBody.getBytes())
                                                 .subscribe().with(
                                                     _ -> log.infof("URI: \"%s\" - Cache no Redis atualizado.", requisicaoOriginal.uri()),
                                                     erroRedis -> log.warnf(
